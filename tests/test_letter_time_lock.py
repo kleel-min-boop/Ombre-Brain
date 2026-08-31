@@ -309,7 +309,7 @@ async def test_dashboard_creates_human_lock_hides_it_from_ai_and_rejects_ai_prox
     bucket_mgr, monkeypatch
 ):
     monkeypatch.setenv("AI_NAME", "张三")
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()
@@ -347,7 +347,7 @@ async def test_dashboard_list_hides_locked_title_and_body_and_patch_only_changes
         unlock_date=PERMANENT_UNLOCK_DATE,
         locked_by="ai",
     )
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()
@@ -386,7 +386,7 @@ async def test_dashboard_content_edit_is_separate_and_preserves_lock_metadata(
         unlock_date=PERMANENT_UNLOCK_DATE,
         locked_by="human",
     )
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(letters.sh, "dehydrator", MagicMock())
@@ -416,7 +416,7 @@ async def test_historical_and_unlocked_dashboard_letters_remain_editable(bucket_
         content="unlocked body", bucket_type="letter", domain=["letter"]
     )
     await bucket_mgr.update(unlocked, author="user", lock_type="none", locked_by="human")
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(letters.sh, "dehydrator", MagicMock())
@@ -452,7 +452,7 @@ async def test_locked_owner_edit_refreshes_embedding_and_other_side_sees_it_only
         return True
 
     monkeypatch.setattr(bucket_mgr.embedding_engine, "generate_and_store", record_embedding)
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(letters.sh, "dehydrator", MagicMock())
@@ -566,7 +566,7 @@ async def test_other_side_cannot_relock_now_public_letter(bucket_mgr):
 async def test_dashboard_owner_can_relock_public_letter_but_not_ai_owned_public_letter(
     bucket_mgr, monkeypatch
 ):
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()
@@ -628,7 +628,7 @@ async def test_dashboard_converts_historical_letter_to_ai_owned_lockable_format(
         letter_date="2024-01-02",
     )
     original = await bucket_mgr.get(historical_id)
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()
@@ -682,7 +682,7 @@ async def test_historical_conversion_is_one_way_and_requires_actual_ai_name(
     historical_id = await bucket_mgr.create(
         content="historical", bucket_type="letter", domain=["letter"]
     )
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()
@@ -711,7 +711,7 @@ async def test_historical_conversion_accepts_request_scoped_ai_name_override(
     historical_id = await bucket_mgr.create(
         content="historical", bucket_type="letter", domain=["letter"]
     )
-    monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(letters.sh, "_require_letter_human_auth", lambda request: None)
     monkeypatch.setattr(letters.sh, "_read_json_object", lambda request: request.json())
     monkeypatch.setattr(letters.sh, "bucket_mgr", bucket_mgr)
     mcp = FakeMCP()

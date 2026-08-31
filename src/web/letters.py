@@ -56,7 +56,7 @@ def register(mcp) -> None:
     async def api_letters(request: Request) -> Response:
         """List all letters, newest first. Supports ?author=user|ai|<署名> filter."""
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
+        err = sh._require_letter_human_auth(request)
         if err:
             return err
         author = request.query_params.get("author", "").strip()
@@ -105,7 +105,7 @@ def register(mcp) -> None:
     async def api_letter_create(request: Request) -> Response:
         """Create a letter from the dashboard."""
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
+        err = sh._require_letter_human_auth(request)
         if err:
             return err
         try:
@@ -235,7 +235,7 @@ def register(mcp) -> None:
     async def api_letter_edit(request: Request) -> Response:
         """Edit Letter fields or lock metadata, never both in one request."""
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
+        err = sh._require_letter_human_auth(request)
         if err:
             return err
         letter_id = request.path_params["letter_id"]
@@ -432,7 +432,7 @@ def register(mcp) -> None:
     async def api_letter_delete(request: Request) -> Response:
         """Delete a letter to archive. Requires ?confirm=true."""
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
+        err = sh._require_letter_human_auth(request)
         if err:
             return err
         if request.query_params.get("confirm", "").lower() not in ("true", "1", "yes"):

@@ -1142,3 +1142,22 @@ def _require_auth(request: Request) -> Response | None:
             status_code=401,
         )
     return None
+
+
+def _require_letter_human_auth(request: Request) -> Response | None:
+    """Authenticate only the four Letter Dashboard routes as a human observer.
+
+    The dedicated observer token is deliberately not a Dashboard session and
+    is never accepted by general Dashboard routes or MCP transport.
+    """
+    from starlette.responses import JSONResponse
+    if _is_authenticated(request):
+        return None
+    configured = os.environ.get("OMBRE_HOME_LETTER_OBSERVER_TOKEN", "")
+    supplied = request.headers.get("X-Ombre-Home-Letter-Token", "")
+    if configured and supplied and hmac.compare_digest(supplied, configured):
+        return None
+    return JSONResponse(
+        {"error": "Unauthorized", "setup_needed": _is_setup_needed()},
+        status_code=401,
+    )
