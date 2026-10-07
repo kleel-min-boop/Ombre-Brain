@@ -1,3 +1,4 @@
+# Zer maintenance acceptance: lane-ombre-20261007
 """创建时间区间过滤 —— breath 五条分支共用。
 
 原来这两个函数长在 `search.py` 里，于是只有检索分支认 `date_from`/`date_to`。
