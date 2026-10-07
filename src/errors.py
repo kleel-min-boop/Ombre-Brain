@@ -73,6 +73,31 @@ class PublicToolError(RuntimeError):
         super().__init__("public tool error")
 
 
+class ToolInputError(ValueError):
+    """入参不合法，工具在任何写入之前就停下了——一个桶都没建。
+
+    为什么需要这个类：MCP 只认异常。工具用 ``return "错误说明"`` 表达失败时，
+    客户端拿到的是一次 ``isError=False`` 的正常返回，调用方（通常是模型自己）
+    会以为写成功了继续往下走，等下次去翻，那条记忆从来没存在过。
+
+    与 PublicToolError 的分工：那个是"固定安全文案，动态正文一个字都不许进"，
+    用于必须收敛话术的失败；这个的正文本来就是要给调用方看的参数校验说明——
+    它得靠这句话知道该改哪个参数。带动态正文的场景先过 safe_error_detail()
+    脱敏，再传进来。
+
+    边界：判据是"这次调用什么都没写"，不是"错在谁"。所以除了入参不合法，
+    写入前的前置条件不成立（原文证据存储不可用、存原文时磁盘失败）同样走这里
+    ——调用方一样需要知道那条记忆没存上。反过来，主体已经成功、只是附带信息
+    没读到的降级提示（``👣 Footprint：暂时无法读取``）不属于这里，
+    那种 isError=False 才对。
+    """
+
+    def __init__(self, message: str):
+        # 折成单行：MCP 把它拼进 "Error executing tool X: ..."，换行会破坏可读性
+        text = " ".join(str(message).split())[:500]
+        super().__init__(text or "入参不合法，未做任何写入。")
+
+
 _SAFE_DETAIL_MAX = 200         # 异常正文对外截断长度（与 import 侧 _CHUNK_ERR_PREVIEW 一致）
 
 
@@ -257,6 +282,20 @@ ERROR_CODES: dict[str, ErrorSpec] = {
             "迁移期间搜索降级为关键词模式，不会丢文件。"
         ),
     ),
+    "OB-W006": ErrorSpec(
+        code="OB-W006",
+        level="W",
+        title_zh="引语超过每桶上限，超出的部分未写入",
+        title_en="quotes exceed per-bucket cap; the overflow was not written",
+        suggestion_zh=(
+            "这条记忆被合并进了一条已有记忆，两边的引语加起来超过了每桶上限"
+            "（默认 3 条）。先记住的那几句被保留，本次多出来的没有写入。\n"
+            "上限是防止「记住几句重要的话」退化成「存原文」——原文层是只写不读的，"
+            "引语不该变成它的替代品。\n"
+            "如果这次多出来的那句确实更重要，可以用 trace(bucket_id, ...) "
+            "看一眼那条桶现在留着哪几句，再决定要不要换。"
+        ),
+    ),
 
     # ---- Info：自动降级 / 轻量提示 ----
     "OB-I002": ErrorSpec(
@@ -366,11 +405,30 @@ def configure_errors_path(buckets_dir: str) -> None:
         _errors_path = None
 
 
+def _ends_with_newline(path: str) -> bool:
+    """文件最后一个字节是不是换行。空文件/读不了都算「是」（不用补）。"""
+    try:
+        if os.path.getsize(path) == 0:
+            return True
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\n"
+    except OSError:
+        return True
+
+
 def _persist_error_record(record: dict) -> None:
     if not _errors_path:
         return
     try:
         with _errors_path_lock:
+            # 崩溃会把最后一行截在中间。直接追加会把新记录粘到那半行后面，
+            # 于是**两条都变成一行读不出来的东西**——而这个日志正是崩溃之后
+            # 要拿来看的，尾行残缺才是常态。先补一个换行，坏的只坏一条。
+            # ledger_mirror 早就这么做了，这里一直漏着。
+            if not _ends_with_newline(_errors_path):
+                with open(_errors_path, "a", encoding="utf-8", newline="\n") as f:
+                    f.write("\n")
             with open(_errors_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -610,6 +668,7 @@ __all__ = [
     "pop_warnings",
     "format_warnings_suffix",
     "PublicToolError",
+    "ToolInputError",
     "OBStartupError",
     "write_fatal_log",
 ]

@@ -20,6 +20,8 @@ from unittest.mock import MagicMock
 import frontmatter
 import pytest
 
+from errors import ToolInputError
+
 import tools._runtime as rt
 from tools._common import (
     check_protected_quota,
@@ -125,10 +127,11 @@ async def test_trace_rejects_unpin_without_same_call_importance(bucket_mgr):
     install_runtime(bucket_mgr)
     pinned_id = await bucket_mgr.create(content="must choose importance", pinned=True)
 
-    result = await trace_core(pinned_id, pinned=0)
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(pinned_id, pinned=0)
 
     unchanged = await bucket_mgr.get(pinned_id)
-    assert "importance" in result
+    assert "importance" in str(excinfo.value)
     assert unchanged["metadata"]["pinned"] is True
     assert unchanged["metadata"]["type"] == "permanent"
     assert unchanged["metadata"]["importance"] == 10
@@ -193,10 +196,11 @@ async def test_active_protected_uses_an_independent_configured_quota(bucket_mgr)
         content="protected quota overflow candidate",
         importance=5,
     )
-    result = await trace_core(candidate_id, protected=1)
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(candidate_id, protected=1)
     candidate = await bucket_mgr.get(candidate_id)
 
-    assert "protected 桶已达上限" in result
+    assert "protected 桶已达上限" in str(excinfo.value)
     assert candidate["metadata"].get("protected", False) is False
     assert candidate["metadata"]["importance"] == 5
     assert await count_protected() == 1
@@ -241,17 +245,19 @@ async def test_trace_restore_dirty_protected_anchor_requires_atomic_unprotect(
     active_path.write_text(frontmatter.dumps(dirty_post), encoding="utf-8")
     assert await bucket_mgr.archive(archived_id) is True
 
-    rejected = await trace_core(archived_id, restore=True)
-    missing_importance = await trace_core(
-        archived_id,
-        restore=True,
-        protected=0,
-    )
+    with pytest.raises(ToolInputError) as 冲突:
+        await trace_core(archived_id, restore=True)
+    with pytest.raises(ToolInputError) as 缺importance:
+        await trace_core(
+            archived_id,
+            restore=True,
+            protected=0,
+        )
     unchanged = await bucket_mgr.get_including_archive(archived_id)
 
-    assert "restore=True, protected=0" in rejected
-    assert "importance=1..10" in rejected
-    assert "importance=1..10" in missing_importance
+    assert "restore=True, protected=0" in str(冲突.value)
+    assert "importance=1..10" in str(冲突.value)
+    assert "importance=1..10" in str(缺importance.value)
     assert unchanged["metadata"]["type"] == "archived"
     assert unchanged["metadata"]["protected"] is True
     assert unchanged["metadata"]["anchor"] is True

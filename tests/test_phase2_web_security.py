@@ -903,11 +903,17 @@ async def test_mcp_exception_secrets_never_reach_response_persistence_or_logs(
     ),
 )
 def test_all_public_mcp_argument_models_forbid_unknown_fields(tool_name):
+    """所有公开工具都必须拒绝未知参数。
+
+    Pydantic 默认的 extra=ignore 会让拼错的参数看似调用成功——写工具甚至会在
+    未应用目标字段的情况下仍然创建记忆。信件 3.2.0 挂到 /mcp-extra、3.4.0 并回
+    主链路，两次搬家这条边界都必须跟着工具走。
+    """
     import server as server_mod
 
     public_tool = server_mod.mcp._tool_manager.get_tool(tool_name)
 
-    assert public_tool is not None
+    assert public_tool is not None, f"{tool_name} 在主连接器上找不到"
     assert public_tool.fn_metadata.arg_model.model_config.get("extra") == "forbid"
 
 

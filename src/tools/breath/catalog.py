@@ -19,10 +19,15 @@ breath_search(query=...) 精准拉取需要的记忆——代替把全部记忆�
 ========================================
 """
 
+from datetime import datetime  # noqa: F401 —— 供签名注解使用
+
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket, letter_lock_state
+from ombrebrain.storage.relation_store import relation_hint
 from utils import parse_bool
 from errors import safe_error_detail
+from ._date_range import bucket_in_created_range
+from ._shared import footprint_reader
 
 # 类型 → (区头, 排序位)。未知类型归入动态区兜底。
 _SECTIONS = [
@@ -38,6 +43,8 @@ async def surface_catalog(
     domain_filter: list[str] | None = None,
     tag_filter: list[str] | None = None,
     max_results: int = 20,
+    created_from: "datetime | None" = None,
+    created_to: "datetime | None" = None,
 ) -> str:
     """返回全部记忆桶的紧凑目录。每桶一行：名称 | 域 | 重要度 | Footprint。"""
     try:
@@ -48,16 +55,17 @@ async def surface_catalog(
     if not buckets:
         return "记忆库为空。"
 
-    try:
-        footprint_snapshot = rt.bucket_mgr.footprint_snapshot()
-    except Exception as exc:
-        rt.logger.warning(f"Footprint snapshot unavailable / 足迹读取失败: {exc}")
-        footprint_snapshot = None
+    # 3.6.0：目录也认 date_from/date_to。「七月我都记了些什么」是目录最自然的
+    # 用法之一，此前这两个参数在这条分支上完全没有落点。
+    if created_from is not None or created_to is not None:
+        buckets = [
+            b for b in buckets
+            if bucket_in_created_range(b, created_from, created_to)
+        ]
+        if not buckets:
+            return "这段时间里没有记忆。"
 
-    def _footprint(bucket: dict, meta: dict) -> str:
-        if footprint_snapshot is None:
-            return "👣 Footprint：暂时无法读取"
-        return footprint_snapshot.summary(str(bucket.get("id") or ""), meta)
+    _footprint = footprint_reader()
 
     grouped: dict[str, list[tuple[int, str]]] = {key: [] for key, _ in _SECTIONS}
     for b in buckets:
@@ -99,6 +107,10 @@ async def surface_catalog(
             f"{pin_mark}{anchor_mark}{name} | {','.join(domains) or '未分类'} | {imp} "
             f"| {_footprint(b, meta)}"
         )
+        if not letter_locked:
+            hint = relation_hint(b)
+            if hint:
+                line += f" | {hint.replace(chr(10), ' | ')}"
         btype = meta.get("type")
         key = "letter" if logical_letter else btype if btype in grouped else "dynamic"
         grouped[key].append((imp, line))

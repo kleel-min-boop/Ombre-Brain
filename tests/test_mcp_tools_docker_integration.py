@@ -30,7 +30,6 @@ EXPECTED_TOOLS = {
     "breath_advanced",
     "hold",
     "grow",
-    "source_read",
     "trace",
     "anchor",
     "release",
@@ -39,6 +38,7 @@ EXPECTED_TOOLS = {
     "letter_write",
     "letter_lock_update",
     "letter_read",
+    "feel",
     "I",
     "dream",
 }
@@ -48,7 +48,6 @@ EXPECTED_TOOL_ORDER = (
     "breath_advanced",
     "hold",
     "grow",
-    "source_read",
     "trace",
     "dream",
     "anchor",
@@ -58,12 +57,16 @@ EXPECTED_TOOL_ORDER = (
     "letter_write",
     "letter_lock_update",
     "letter_read",
+    "feel",
     "I",
 )
 
 EXPECTED_TOOL_PROPERTIES = {
     "breath": set(),
-    "breath_search": {"query", "domain", "max_results", "date_from", "date_to"},
+    "breath_search": {
+        "query", "domain", "max_results", "date_from", "date_to", "quotes",
+        "mode", "with_ids",
+    },
     "breath_advanced": {
         "query",
         "max_tokens",
@@ -76,6 +79,9 @@ EXPECTED_TOOL_PROPERTIES = {
         "catalog",
         "date_from",
         "date_to",
+        "quotes",
+        "mode",
+        "with_ids",
     },
     "hold": {
         "content",
@@ -91,12 +97,20 @@ EXPECTED_TOOL_PROPERTIES = {
         "meaning",
         "media",
         "test_data",
+        "domain",
+        "source_content",
+        "source_ranges",
+        "quotes",
     },
+    # grow 的 quotes 在 items 的元素里，不是顶层参数——digest 路径不该有引语。
     "grow": {"content", "items", "test_data"},
-    "source_read": {"bucket_id", "expected_title", "scope", "cursor", "max_tokens"},
     "trace": {
         "bucket_id",
         "name",
+        # name 是桶名（进文件名、做显示回退），title 是这条记忆自己的标题，
+        # 信件的标题就存在 title 里。两个字段各走各的，缺了 title 这一项，
+        # 模型只能拿 name 去改信件标题，改的却是另一样东西。
+        "title",
         "domain",
         "valence",
         "arousal",
@@ -121,6 +135,18 @@ EXPECTED_TOOL_PROPERTIES = {
         "restore",
         "old_str",
         "new_str",
+        "deletion_request_id",
+        "deletion_decision",
+        "deletion_ai_reason",
+        # 3.3.0：修正后端自动建错的桶间关系。relink 只能改已存在关系的
+        # 类型，凭空建立仍然只归后端——没有对应的 link 参数是有意的。
+        "unlink",
+        "relink",
+        "relation_type",
+        # 3.4.0：订正/删除写入那一刻留下的引语。只有 replace，没有 append——
+        # 补录不归 trace，同上一条是一个道理。
+        "quotes_replace",
+        "reinforce",
     },
     "anchor": {"bucket_id"},
     "release": {"bucket_id"},
@@ -132,18 +158,20 @@ EXPECTED_TOOL_PROPERTIES = {
     },
     "letter_lock_update": {"letter_id", "lock_type", "unlock_date"},
     "letter_read": {"query", "limit", "author", "date_from", "date_to"},
-    "I": {"content", "aspect", "read", "limit", "promote"},
+    "feel": {"query", "max_tokens"},
+    # supersedes：3.6.6 的「声明取代即挂起旧条目」。
+    "I": {"content", "aspect", "read", "limit", "promote", "supersedes"},
     "dream": {"window_hours"},
 }
 
 EXPECTED_REQUIRED_PROPERTIES = {
     "breath_search": {"query"},
     "hold": {"content"},
-    "source_read": {"bucket_id", "expected_title"},
     "trace": {"bucket_id"},
     "anchor": {"bucket_id"},
     "release": {"bucket_id"},
     "plan": {"content"},
+    "feel": {"query"},
     "letter_write": {"author", "content"},
     "letter_lock_update": {"letter_id", "lock_type"},
 }
@@ -260,6 +288,44 @@ def mcp_client():
     client.close()
 
 
+def _rejection_text(mcp_client, tool: str, arguments: dict) -> str:
+    """跑一次注定被拒的调用，把错误正文取出来。
+
+    工具「什么都没写」的失败在 MCP 侧是 isError=True，正文进
+    `Error executing tool <name>: ...`。用 `call()` 取不到——它第一件事就是
+    断言 isError is not True。
+
+    为什么不能用返回字符串表达这类失败：那在客户端是一次正常返回，调用方
+    （通常是模型自己）会以为写成功了继续往下走，等下次去翻，那条记忆从来
+    没存在过。关键词仍逐条核对——模型正是靠那句话知道该改哪个参数。
+    """
+    result = mcp_client.call_result(tool, arguments)
+    assert result.get("isError") is True, (tool, result)
+    text = mcp_client.result_text(result)
+    assert text, (tool, result)
+    return text
+
+
+# 信件 3.2.0 拆到 /mcp-extra，3.4.0 并回主链路。这条 URL 只用来验证退役端点
+# 确实没了——所有工具（含信件）都在 MCP_URL 上。
+MCP_EXTRA_URL = MCP_URL.rstrip("/").removesuffix("/mcp") + "/mcp-extra" if MCP_URL else ""
+
+def test_retired_extra_connector_is_not_reachable():
+    """/mcp-extra 并回主链路后必须真的没了，不能只是"也还能连"。
+
+    留着旧端点是最坏的一种"兼容"：两条路都能写，但只有一条路上挂着严格参数
+    校验与体积限制，另一条会静默变成旁路。
+    """
+    response = httpx.post(
+        MCP_EXTRA_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        headers={"accept": "application/json, text/event-stream"},
+        timeout=30.0,
+        trust_env=False,
+    )
+    assert response.status_code == 404
+
+
 def _marker(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
@@ -272,6 +338,17 @@ def _bucket_id(text: str) -> str:
 
 def _bucket_ids(text: str) -> set[str]:
     return set(re.findall(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])", text))
+
+
+def _i_witness_progress(text: str, bucket_id: str) -> tuple[int, int]:
+    # 括号里 3.6.6 起会跟一段滞留诊断（「已等 N 天、经历 M 场梦」之类），
+    # 所以别把右括号钉死在「次 dream」后面——这里要的只是见证进度那两个数。
+    match = re.search(
+        rf"{re.escape(bucket_id)}\s+（(\d+)/(\d+) 次 dream[^）]*）",
+        text,
+    )
+    assert match, text
+    return int(match.group(1)), int(match.group(2))
 
 
 def _hold(mcp_client: MCPClient, marker: str, **overrides) -> str:
@@ -319,7 +396,7 @@ def test_concurrent_clients_discover_the_same_stateless_dream_schema():
     assert set(schemas[0]["properties"]) == {"window_hours"}
 
 
-def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
+def test_manifest_exposes_exactly_the_documented_main_tools(mcp_client):
     tools = mcp_client.list_tools()
     assert [tool["name"] for tool in tools] == list(EXPECTED_TOOL_ORDER)
     tools_by_name = {tool["name"]: tool for tool in tools}
@@ -338,6 +415,7 @@ def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
     assert tools_by_name["breath"]["inputSchema"].get("properties") == {}
 
 
+
 @pytest.mark.parametrize(
     ("tool", "arguments", "field"),
     [
@@ -346,16 +424,18 @@ def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
         ("breath_advanced", {"catalog": {"not": "a boolean"}}, "catalog"),
         ("hold", {}, "content"),
         ("grow", {"items": {"not": "a list"}}, "items"),
-        ("source_read", {}, "bucket_id"),
         ("trace", {}, "bucket_id"),
         ("anchor", {}, "bucket_id"),
         ("release", {}, "bucket_id"),
         ("pulse", {"include_archive": {"not": "a boolean"}}, "include_archive"),
         ("plan", {}, "content"),
-        ("letter_write", {"content": "missing author"}, "author"),
-        ("letter_read", {"limit": {"not": "an integer"}}, "limit"),
         ("I", {"read": {"not": "a boolean"}}, "read"),
         ("dream", {"window_hours": {"not": "an integer"}}, "window_hours"),
+        # 信件搬回主连接器后和其余工具走同一份用例——这正是并回主链路要的：
+        # 一套边界，不必再问"这个工具挂在哪，那边的校验跟上了没有"。
+        ("letter_write", {"content": "missing author"}, "author"),
+        ("letter_read", {"limit": {"not": "an integer"}}, "limit"),
+        ("letter_lock_update", {"letter_id": "x"}, "lock_type"),
     ],
 )
 def test_all_tools_reject_schema_invalid_arguments(mcp_client, tool, arguments, field):
@@ -374,7 +454,6 @@ def test_all_tools_reject_schema_invalid_arguments(mcp_client, tool, arguments, 
         ("breath_advanced", {}),
         ("hold", {"content": "unknown-field-probe", "test_data": True}),
         ("grow", {"items": []}),
-        ("source_read", {"bucket_id": "unknown", "expected_title": "unknown"}),
         ("trace", {"bucket_id": "missing-unknown-field-probe"}),
         ("anchor", {"bucket_id": "missing-unknown-field-probe"}),
         ("release", {"bucket_id": "missing-unknown-field-probe"}),
@@ -414,13 +493,15 @@ def test_hold_writes_a_memory_and_returns_bucket_id(mcp_client):
 
 
 def test_hold_rejects_invalid_feel_and_test_data_combinations(mcp_client):
-    missing_source = mcp_client.call(
+    missing_source = _rejection_text(
+        mcp_client,
         "hold",
         {"content": _marker("feel"), "feel": True, "valence": 0.5, "arousal": 0.5},
     )
     assert "source_bucket 不能为空" in missing_source
 
-    non_erasable_mode = mcp_client.call(
+    non_erasable_mode = _rejection_text(
+        mcp_client,
         "hold",
         {"content": _marker("test-pin"), "test_data": True, "pinned": True},
     )
@@ -552,7 +633,8 @@ def test_grow_items_accepts_why_remembered_contract(mcp_client):
 
 def test_grow_items_rejects_oversized_why_remembered_contract(mcp_client):
     marker = _marker("grow-items-why-too-long")
-    result = mcp_client.call(
+    text = _rejection_text(
+        mcp_client,
         "grow",
         {"items": [{
             "content": marker,
@@ -560,7 +642,7 @@ def test_grow_items_rejects_oversized_why_remembered_contract(mcp_client):
         }]},
     )
 
-    assert "grow items 第 1 项 why_remembered 不能超过 500 个字符" in result
+    assert "grow items 第 1 项 why_remembered 不能超过 500 个字符" in text
 
 
 def test_grow_long_content_obeys_configured_provider_contract(mcp_client):
@@ -570,8 +652,12 @@ def test_grow_long_content_obeys_configured_provider_contract(mcp_client):
     result = mcp_client.call("grow", {"content": content})
 
     if not EXPECT_COMPRESSION_PROVIDER:
+        # 文案跟着 errors.llm_step_failed_error 的分岔走：这条分支代表服务确实
+        # 没配 provider（api_available=False），断言只咬「不可用」这半句和错误码，
+        # 不咬后面那串配置项名，免得产品换个指引措辞就把测试打红。
         assert "OB-E004" in result
-        assert "API key 未配置或调用失败" in result
+        assert "脱水 API 不可用" in result
+        assert "桶未创建" in result
         after_ids = _bucket_ids(mcp_client.call("pulse", {"include_archive": True}))
         assert after_ids == before_ids
         return
@@ -579,41 +665,6 @@ def test_grow_long_content_obeys_configured_provider_contract(mcp_client):
     assert "batch:g_" in result
     recalled = mcp_client.call("breath_search", {"query": marker, "max_results": 5})
     assert marker in recalled
-
-
-def test_grow_items_source_layer_requires_exact_title_and_reads_one_event(mcp_client):
-    marker = _marker("source-layer")
-    source = f"开场 {marker}\n妻子说 wife 喔，不是 girlfriend 喔。\n直接 wife。\n尾声"
-    result = mcp_client.call(
-        "grow",
-        {
-            "content": source,
-            "items": [{
-                "title": "wife",
-                "content": f"{marker} 她注意到我直接用了 wife。",
-                "tags": ["老婆", "称呼"],
-                "importance": 8,
-                "domain": ["恋爱"],
-                "source_ranges": [[2, 3]],
-            }],
-        },
-    )
-    bucket_id = list(re.findall(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])", result))[-1]
-
-    denied = mcp_client.call(
-        "source_read",
-        {"bucket_id": bucket_id, "expected_title": "直接确认关系"},
-    )
-    assert "标题不匹配" in denied
-
-    event = mcp_client.call(
-        "source_read",
-        {"bucket_id": bucket_id, "expected_title": "wife", "scope": "event"},
-    )
-    assert "wife 喔" in event
-    assert "直接 wife" in event
-    assert "开场" not in event
-    assert "尾声" not in event
 
 
 def test_trace_updates_existing_memory_metadata(mcp_client):
@@ -813,6 +864,27 @@ def test_I_writes_and_reads_pending_self_description(mcp_client):
     assert marker in read_back
 
 
+def test_I_candidate_visible_in_dream_advances_one_witness(mcp_client):
+    marker = _marker("i-dream-witness")
+    written = mcp_client.call(
+        "I",
+        {"content": marker, "aspect": "patterns"},
+    )
+    candidate_id = _bucket_id(written)
+
+    before = mcp_client.call("I", {"read": True, "limit": 100})
+    assert marker in before
+    assert _i_witness_progress(before, candidate_id) == (0, 3)
+
+    dreamed = mcp_client.call("dream", {"window_hours": 48})
+    assert marker in dreamed
+    assert candidate_id in dreamed
+
+    after = mcp_client.call("I", {"read": True, "limit": 100})
+    assert marker in after
+    assert _i_witness_progress(after, candidate_id) == (1, 3)
+
+
 def test_dream_returns_recent_complete_memory(mcp_client):
     marker = _marker("dream")
     _hold(mcp_client, marker)
@@ -839,8 +911,7 @@ def test_dream_clamps_window_to_documented_bounds(mcp_client, window_hours, expe
     ],
 )
 def test_query_tools_enforce_query_size_limit(mcp_client, tool, arguments):
-    result = mcp_client.call(tool, arguments)
-    assert "查询过大" in result
+    assert "查询过大" in _rejection_text(mcp_client, tool, arguments)
 
 
 @pytest.mark.parametrize(
@@ -850,15 +921,15 @@ def test_query_tools_enforce_query_size_limit(mcp_client, tool, arguments):
         ("grow", {"content": ""}, "内容为空"),
         ("trace", {"bucket_id": "missing-boundary-id"}, "missing-boundary-id"),
         ("anchor", {"bucket_id": "missing-boundary-id"}, "anchor"),
-        ("release", {"bucket_id": "missing-boundary-id"}, "释放失败"),
+        # 3.0.0：与 anchor 侧对称，改为第一人称并补标点。
+        ("release", {"bucket_id": "missing-boundary-id"}, "我没能把它移开"),
         ("plan", {"content": ""}, "内容为空"),
         ("letter_write", {"author": "", "content": "x"}, "author"),
         ("I", {"content": "x", "aspect": "prompt-injected"}, "aspect 无效"),
     ],
 )
 def test_invalid_tool_arguments_fail_cleanly(mcp_client, tool, arguments, expected):
-    result = mcp_client.call(tool, arguments)
-    assert expected in result
+    assert expected in _rejection_text(mcp_client, tool, arguments)
 
 
 def test_prompt_injection_text_is_returned_verbatim_without_any_safety_markers(mcp_client):
@@ -883,18 +954,22 @@ def test_prompt_injection_text_is_returned_verbatim_without_any_safety_markers(m
 
 
 def test_path_traversal_shaped_bucket_id_is_treated_as_an_identifier(mcp_client):
-    result = mcp_client.call("trace", {"bucket_id": "../../../../etc/passwd", "importance": 9})
-    assert "未找到记忆桶" in result
+    text = _rejection_text(
+        mcp_client, "trace", {"bucket_id": "../../../../etc/passwd", "importance": 9}
+    )
+    assert "未找到记忆桶" in text
 
 
 def test_grow_rejects_excessive_source_before_llm_call(mcp_client):
-    result = mcp_client.call("grow", {"content": "x" * (2 * 1024 * 1024 + 1)})
-    assert "grow 输入过大" in result
+    text = _rejection_text(mcp_client, "grow", {"content": "x" * (2 * 1024 * 1024 + 1)})
+    assert "grow 输入过大" in text
 
 
 def test_grow_rejects_excessive_item_count(mcp_client):
-    result = mcp_client.call("grow", {"items": [f"item-{index}" for index in range(101)]})
-    assert "items 过多" in result
+    text = _rejection_text(
+        mcp_client, "grow", {"items": [f"item-{index}" for index in range(101)]}
+    )
+    assert "items 过多" in text
 
 
 @pytest.mark.parametrize("tool,arguments", [
@@ -903,23 +978,21 @@ def test_grow_rejects_excessive_item_count(mcp_client):
     ("I", {"content": "x" * (50 * 1024 + 1), "aspect": "values"}),
 ])
 def test_single_bucket_tools_enforce_bucket_size_limit(mcp_client, tool, arguments):
-    result = mcp_client.call(tool, arguments)
-    assert "内容过大" in result
+    assert "内容过大" in _rejection_text(mcp_client, tool, arguments)
 
 
 def test_hold_enforces_bucket_size_limit(mcp_client):
-    result = mcp_client.call("hold", {"content": "x" * (50 * 1024 + 1)})
-    assert "内容过大" in result
+    text = _rejection_text(mcp_client, "hold", {"content": "x" * (50 * 1024 + 1)})
+    assert "内容过大" in text
 
 
 def test_trace_rejects_oversized_replacement_without_losing_original(mcp_client):
     marker = _marker("trace-size")
     bucket_id = _hold(mcp_client, marker)
-    result = mcp_client.call(
-        "trace",
-        {"bucket_id": bucket_id, "content": "x" * (50 * 1024 + 1)},
+    text = _rejection_text(
+        mcp_client, "trace", {"bucket_id": bucket_id, "content": "x" * (50 * 1024 + 1)}
     )
-    assert "内容过大" in result
+    assert "内容过大" in text
 
     recalled = mcp_client.call("breath_search", {"query": bucket_id, "max_results": 1})
     assert marker in recalled

@@ -69,6 +69,12 @@ def is_within_window(meta: dict, cutoff: datetime) -> bool:
 
 
 def collect_core_context(all_buckets: list) -> list:
+    """Compatibility selector for callers that still inspect dream core candidates.
+
+    Dream dispatch intentionally no longer consumes or renders this list.  Keep
+    the selector available for policy/regression callers without reintroducing
+    pinned/permanent content into dream output.
+    """
     core = [
         b for b in all_buckets
         if (

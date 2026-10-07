@@ -6,7 +6,7 @@ tools/_common.py — 跨工具共享的辅助逻辑
 这个文件收纳被多个工具同时复用的、与具体工具语义无关的小工具：
 配额检查（单桶字节上限 / pinned/protected 数量上限）、
 合并或新建（hold/grow 共用）、
-新桶疑似重复扫描、新事件触发的 plan 自动闭环判定。
+新桶疑似重复扫描、新事件触发的 plan 完成建议判定。
 
 关键行为：
 - check_content_size / check_pinned_quota / check_protected_quota：读取
@@ -16,8 +16,8 @@ tools/_common.py — 跨工具共享的辅助逻辑
 - iter 2.0：merge_or_create 接受 ``source_tool`` / ``grow_batch_id``，
   新建时写入 frontmatter；合并时不动原桶 source_tool，只追加 ``last_merged_by``
 - check_duplicate_for：fire-and-forget 标记疑似重复对（不自动合并）
-- check_plan_resolution：fire-and-forget 用关键词/向量双通道预筛 + LLM 保守判断
-  来把已完成的 active plan 标为 resolved
+- check_plan_resolution：fire-and-forget 用关键词/向量双通道预筛 + LLM 保守判断，
+  只记录可能已完成的建议，保留 active 状态等待显式确认
 
 不做什么（边界）：
 - 不持有任何全局对象，所有依赖都从 _runtime 取
@@ -41,10 +41,12 @@ import math
 import threading
 
 from bucket_manager import _filesystem_turn as _kernel_filesystem_turn
-from utils import normalize_memory_title, parse_bool
+from utils import normalize_memory_title, now_iso, parse_bool
+from ombrebrain.storage import bucket_paths as _bp
 from ombrebrain.domain.plan_history import append_plan_change_log as append_plan_change_log
 
 from . import _runtime as rt
+from ._relation_link import link_new_bucket
 
 _EMBED_WARN = (
     "向量暂未完成，该桶当前仅支持关键词匹配；正文已保存。"
@@ -70,6 +72,10 @@ _WHY_REMEMBERED_MAX_CHARS = 500
 _GROW_ITEM_FIELDS = frozenset({
     "content", "title", "name", "tags", "importance", "domain",
     "valence", "arousal", "source_ranges", "why_remembered",
+    # quotes 只在 grow(items=[...]) 这条路上有效：items 是我自己拆好的，
+    # 每条都经过我的手。digest 路径（grow(content=...)）拆出来的条目是 LLM
+    # 的产物，我没有逐条决定过——那里不该有引语，见架构说明 §5.2「谁决定」。
+    "quotes",
 })
 
 # --- importance 审计范围排除的类型（is_importance_audit_candidate 复用）---
@@ -354,6 +360,13 @@ def check_grow_items_payload(items: list) -> str | None:
                 raw_text = item.get(field)
                 if raw_text is not None and not isinstance(raw_text, str):
                     return f"grow items 第 {index} 项 {field} 必须是字符串。"
+            if item.get("quotes") not in (None, "", []):
+                from ombrebrain.storage.quote_store import normalize_quotes
+
+                try:
+                    normalize_quotes(item["quotes"])
+                except ValueError as exc:
+                    return f"grow items 第 {index} 项引语无效，未创建任何桶：{exc}"
             try:
                 normalize_memory_title(item.get("title"))
             except ValueError as exc:
@@ -634,15 +647,15 @@ async def restore_archived_letters(
             metadata = bucket.get("metadata") or {}
             if not isinstance(metadata, dict):
                 continue
-            strong = bucket_mgr._has_strong_letter_marker(metadata)
-            ambiguous = bucket_mgr._has_ambiguous_letter_marker(metadata)
+            strong = _bp.has_strong_letter_marker(metadata)
+            ambiguous = _bp.has_ambiguous_letter_marker(metadata)
             if not (strong or ambiguous):
                 continue
             relevant_rows.append(bucket)
             path = str(bucket.get("path") or "")
             if (
                 str(metadata.get("type") or "").strip().casefold() == "archived"
-                or bucket_mgr._path_is_within(path, bucket_mgr.archive_dir)
+                or _bp.path_is_within(path, bucket_mgr.archive_dir)
             ):
                 has_archived_signal = True
 
@@ -656,12 +669,12 @@ async def restore_archived_letters(
         bucket = relevant_rows[0]
         metadata = bucket.get("metadata") or {}
         path = str(bucket.get("path") or "")
-        if not bucket_mgr._path_is_within(path, bucket_mgr.archive_dir):
+        if not _bp.path_is_within(path, bucket_mgr.archive_dir):
             reason = "not_archived"
         elif str(metadata.get("type") or "").strip().casefold() != "archived":
             reason = "invalid_archived_type"
         else:
-            reason = bucket_mgr._archived_letter_rejection(metadata)
+            reason = bucket_mgr.archived_letter_rejection(metadata)
         if reason:
             exclusions.append({"id": bucket_id, "reason": reason})
         else:
@@ -796,6 +809,7 @@ async def merge_or_create(
     name: str = "",
     title: str = "",
     source_refs: list | None = None,
+    quotes: list | None = None,
     raw_merge: bool = False,
     why_remembered: str = "",
     merge_why_remembered: str = "",
@@ -827,7 +841,7 @@ async def merge_or_create(
         result = await _merge_or_create_inner(
             content=content, tags=tags, importance=importance, domain=domain,
             valence=valence, arousal=arousal, name=name, title=title,
-            source_refs=source_refs, raw_merge=raw_merge,
+            source_refs=source_refs, quotes=quotes, raw_merge=raw_merge,
             why_remembered=why_remembered,
             merge_why_remembered=merge_why_remembered,
             source_tool=source_tool,
@@ -858,6 +872,7 @@ async def _merge_or_create_inner(
     name: str = "",
     title: str = "",
     source_refs: list | None = None,
+    quotes: list | None = None,
     raw_merge: bool = False,
     why_remembered: str = "",
     merge_why_remembered: str = "",
@@ -1022,6 +1037,11 @@ async def _merge_or_create_inner(
                             update_kwargs["name"] = title
                     if source_refs:
                         update_kwargs["source_refs_append"] = source_refs
+                    if quotes:
+                        # 合并到已有桶时引语追加，不覆盖：每条引语属于它自己的时刻，
+                        # 不因为两段记忆被判定为同一件事就作废。超上限的处理见
+                        # BucketManager._merge_quotes（丢弃并 OB-W006 明说）。
+                        update_kwargs["quotes_append"] = quotes
                     if source_tool:
                         update_kwargs["last_merged_by"] = source_tool
                     # grow digest 在首次拆条时还没有稳定的目标桶，
@@ -1140,6 +1160,7 @@ async def _merge_or_create_inner(
             media=media,
             test_data=test_data,
             source_refs=source_refs,
+            quotes=quotes,
             defer_derived_index=_defer_derived_index,
             # hold 的铁律：正文优先落盘。打标/embedding 可降级，但绝不压缩或撤销记忆。
             allow_embedding_fallback=(raw_merge and source_tool == "hold"),
@@ -1258,6 +1279,12 @@ async def _merge_or_create_inner(
         f"source_tool={source_tool or '_'} grow_batch_id={grow_batch_id or '_'} "
         f"embedding_state={embedding_state}"
     )
+    # 自动建立桶间关系：fire-and-forget，写入返回不等它。
+    # 只在**新建**时触发——合并进已有桶时那条桶的关系已经建过了，
+    # 重复推断只会反复撞每桶上限。关系建不出来不影响记忆本身。
+    if not test_data:
+        asyncio.create_task(link_new_bucket(bucket_id, content))
+
     return bucket_id, False, embed_warn
 
 
@@ -1324,7 +1351,7 @@ async def _rank_active_plans_by_query(
 
 
 async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "") -> None:
-    """新事件触发 active plan 关键词/向量召回，再由 LLM 保守判断是否闭环。"""
+    """新事件只检查检索命中的 active plan，并把 LLM 结果记录为建议。"""
     try:
         from .plan.core import is_letter_bucket
 
@@ -1354,7 +1381,7 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
         # 小模型调用数，避免 active plan 很多时一次写入触发无界 API 请求。
         plan_candidates = []
         seen_plan_ids: set[str] = set()
-        for candidate in keyword_candidates + vector_candidates + active_plans:
+        for candidate in keyword_candidates + vector_candidates:
             candidate_id = str(candidate.get("id") or "")
             if not candidate_id or candidate_id in seen_plan_ids:
                 continue
@@ -1367,15 +1394,21 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
                 judgement = await rt.dehydrator.judge_plan_resolution(
                     p["content"], new_event_text
                 )
-                if judgement.get("resolved") and judgement.get("confidence", 0.0) >= _PLAN_LLM_CONFIDENCE_MIN:
+                confidence = float(judgement.get("confidence") or 0.0)
+                if judgement.get("resolved") and confidence >= _PLAN_LLM_CONFIDENCE_MIN:
+                    reason = str(judgement.get("reason") or "")[:_RESOLUTION_REASON_MAX]
                     await rt.bucket_mgr.update(
                         p["id"],
-                        status="resolved",
-                        resolution_reason=judgement.get("reason", "")[:_RESOLUTION_REASON_MAX],
-                        resolved_by=source_bucket_id or "",
+                        resolution_suggested={
+                            "reason": reason,
+                            "confidence": confidence,
+                            "suggested_by": "plan_resolution_judge",
+                            "source_bucket_id": source_bucket_id or "",
+                            "ts": now_iso(),
+                        },
                     )
                     rt.logger.info(
-                        f"plan auto-resolved: {p['id']} — {judgement.get('reason', '')[:_LOG_REASON_PREVIEW]}"
+                        f"plan resolution suggested: {p['id']} — {reason[:_LOG_REASON_PREVIEW]}"
                     )
             except Exception as e:
                 rt.logger.warning(f"plan resolution judgement failed for {p['id']}: {e}")
@@ -1391,8 +1424,8 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
 # 这是 rule.md §1 哲学落地：plan 是承诺，承诺被放下，承载这条承诺
 # 的事件桶也不该再浮上来。
 #
-# 不联动的路径：check_plan_resolution（LLM 自动二判）—— 自动判定
-# 的可信度低于人工/AI 显式动作，避免把活的事件桶意外打沉。
+# check_plan_resolution（LLM 自动二判）只写 resolution_suggested，
+# 不改变 plan status，因此也不会进入这条联动路径。
 #
 # 反向不做：bucket trace(resolved=1) 不联动 plan（plan 是独立承诺，
 # 单条事件结束不等于承诺达成）。

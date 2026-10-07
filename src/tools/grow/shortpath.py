@@ -10,7 +10,7 @@ merge_or_create，省一次 LLM 拆分调用。
 - 调 analyze 拿 domain/valence/arousal/tags/suggested_name
 - 用 raw_merge=True 与 hold 对齐：保留原文不压缩（修了 2.0 之前
   短日记被 LLM 偷偷压缩的 bug）
-- 写完 fire-and-forget：plan 自动闭环 + 新桶疑似重复扫描
+- 写完 fire-and-forget：plan 完成建议 + 新桶疑似重复扫描
 
 不做什么（边界）：
 - 不拆分：短到这种程度本就该是单条

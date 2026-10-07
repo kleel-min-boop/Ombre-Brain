@@ -175,17 +175,20 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
 
         request_id = 0
 
-        def mcp_request(method, params=None):
+        def mcp_request(method, params=None, path="/mcp"):
             nonlocal request_id
             request_id += 1
             response = client.post(
-                "/mcp",
+                path,
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
                 json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
             )
             assert response.status_code == 200, response.text
             return response.json()
 
+        # 信件 3.2.0 拆到 /mcp-extra、3.4.0 并回 /mcp。这条用例验证的是
+        # "AI 通过 MCP 读信时看不到人类的私密信件"——两次搬家边界都没变，
+        # 变的只是端点。
         mcp_request("initialize", {
             "protocolVersion": "2025-03-26",
             "capabilities": {},
@@ -297,7 +300,12 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
 
         assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 404
         assert client.get("/.well-known/oauth-protected-resource/not-a-route").status_code == 404
+        # /mcp-extra 自 3.4.0 随信件并回主链路而再次退役：这条路不存在了，
+        # 要的就是 404。3.2.0–3.3.0 期间它是信件连接器，那时 GET 拿的是 406
+        # （streamable-http 只接受 POST + JSON Accept）。
         assert client.get("/mcp-extra").status_code == 404
+        # 主连接器仍在，GET 拿 406 而不是 404
+        assert client.get("/mcp").status_code == 406
 
         invalid_transport = client.post(
             "/api/transport",

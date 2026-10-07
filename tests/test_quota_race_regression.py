@@ -17,6 +17,8 @@ from unittest.mock import MagicMock
 import asyncio
 import pytest
 
+from errors import ToolInputError
+
 import tools._runtime as rt
 from tools._common import (
     _quota_turn,
@@ -73,6 +75,24 @@ async def test_concurrent_hold_pinned_does_not_exceed_cap(bucket_mgr, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_store_pinned_explicit_domain_overrides_analysis(bucket_mgr):
+    install_runtime(bucket_mgr)
+
+    result = await store_pinned(
+        content="显式 pinned domain",
+        extra_tags=[],
+        valence=0.5,
+        arousal=0.3,
+        why_remembered="",
+        explicit_domain=["人工域"],
+    )
+
+    bucket_id = result.split("→", 1)[1].split()[0]
+    bucket = await bucket_mgr.get(bucket_id)
+    assert bucket["metadata"]["domain"] == ["人工域"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_trace_protect_does_not_exceed_independent_cap(bucket_mgr):
     install_runtime(bucket_mgr, limits={"max_protected": 3})
 
@@ -83,11 +103,18 @@ async def test_concurrent_trace_protect_does_not_exceed_independent_cap(bucket_m
         for i in range(5)
     ]
 
-    await asyncio.gather(*[
+    结果 = await asyncio.gather(*[
         trace_core(bucket_id, protected=1)
         for bucket_id in candidates
-    ])
+    ], return_exceptions=True)
 
+    # 配额只剩一个位置：一个成功，其余四个必须被明确拒绝，
+    # 不能有任何一个「静默没保护上却报成功」。
+    被拒 = [r for r in 结果 if isinstance(r, ToolInputError)]
+    成功 = [r for r in 结果 if not isinstance(r, BaseException)]
+    assert len(成功) == 1, f"应当只有一个抢到配额，实际 {len(成功)} 个"
+    assert len(被拒) == 4
+    assert all("已达上限" in str(e) for e in 被拒)
     assert await count_protected() == 3
     protected_candidates = 0
     for bucket_id in candidates:
