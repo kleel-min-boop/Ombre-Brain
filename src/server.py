@@ -1427,6 +1427,15 @@ migrate_engine.attach_them_runtime(them_service, them_tool_gate)
 # ============================================================
 from web.oauth import _is_valid_mcp_token, _is_valid_static_mcp_token  # noqa: F401
 
+# B background memory has a neutral HTTP contract, not a companion MCP tool.
+from tools.hold.b_auto import register as _register_b_memory
+from server_app import HTTPRuntimeSettings as _BHTTPSettings
+_b_auth_mode = _BHTTPSettings.from_config(config).auth_mode
+_b_validators = ((_is_valid_static_mcp_token,) if _b_auth_mode == 'token' else
+                 (_is_valid_mcp_token, _is_valid_static_mcp_token) if _b_auth_mode == 'hybrid' else
+                 (_is_valid_mcp_token,))
+_register_b_memory(mcp, _b_validators)
+
 
 # ============================================================
 # Cloudflare Tunnel 管理 —— 已拆分到 web/tunnel.py（路由在其 register 内注册）。

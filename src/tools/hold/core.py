@@ -48,6 +48,7 @@ async def store_core(
     source_refs: list[dict] | None = None,
     quotes: list[dict] | None = None,
     dream_archive: bool = False,
+    _b_receipt: dict | None = None,
 ) -> str:
     metadata_fallback = False
     try:
@@ -115,6 +116,11 @@ async def store_core(
         media=media,
         test_data=test_data,
     )
+
+    if _b_receipt is not None:
+        # Internal structured acknowledgement, before optional follow-up tasks.
+        # Public hold output/signature in dispatch and MCP remain unchanged.
+        _b_receipt.update(provider_id=result_name, merged=is_merged)
 
     action = "合并→" if is_merged else "新建→"
     asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
