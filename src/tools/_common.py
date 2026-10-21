@@ -36,6 +36,7 @@ import asyncio
 from copy import deepcopy
 from concurrent.futures import Future, InvalidStateError
 from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 import hashlib
 import math
 import threading
@@ -46,6 +47,10 @@ from ombrebrain.storage import bucket_paths as _bp
 from ombrebrain.domain.plan_history import append_plan_change_log as append_plan_change_log
 
 from . import _runtime as rt
+
+# Per-task opt-in evidence sink. Public hold/grow and merge signatures stay
+# unchanged; ordinary callers incur no additional storage reads.
+_b_write_receipt = ContextVar('b_write_receipt', default=None)
 from ._relation_link import link_new_bucket
 
 _EMBED_WARN = (
@@ -1081,6 +1086,10 @@ async def _merge_or_create_inner(
                             != snapshot_content
                             or locked_metadata != snapshot_metadata
                         ):
+                            b_receipt = _b_write_receipt.get()
+                            if b_receipt is not None:
+                                b_receipt['preimage_conflict'] = True
+                                raise RuntimeError('B merge preimage conflicted; no retry')
                             continue
 
                         update_method = (
@@ -1090,6 +1099,13 @@ async def _merge_or_create_inner(
                         )
                         if use_locked_update:
                             update_kwargs["_derived_state_out"] = derived_state
+                        b_receipt = _b_write_receipt.get()
+                        before_hash = None
+                        if b_receipt is not None:
+                            b_receipt['commit_attempted'] = True
+                            before_text = locked_bucket.get('content')
+                            if use_locked_update and isinstance(before_text, str):
+                                before_hash = hashlib.sha256(before_text.encode('utf-8')).hexdigest()
                         committed = await update_method(
                             candidate_id,
                             allow_embedding_fallback=(
@@ -1099,7 +1115,29 @@ async def _merge_or_create_inner(
                             **update_kwargs,
                         )
                         if not committed:
+                            if b_receipt is not None:
+                                raise RuntimeError('B update commit unconfirmed; no create fallback')
                             break
+
+                        if b_receipt is not None and use_locked_update:
+                            # Both snapshots are inside the exact target bucket
+                            # turn, after the optimistic preimage check. A read
+                            # failure must NOT enter the outer create fallback
+                            # after a successful mutation.
+                            proof = dict(provider_id=candidate_id, change_kind='unobserved_change')
+                            try:
+                                after_commit = await rt.bucket_mgr.get(candidate_id)
+                                after_text = after_commit['content'] if after_commit else None
+                                if (after_commit and after_commit.get('id') == candidate_id
+                                        and before_hash is not None and isinstance(after_text, str)
+                                        and after_text == derived_state.get('content')):
+                                    after_hash = hashlib.sha256(after_text.encode('utf-8')).hexdigest()
+                                    proof.update(previous_version=before_hash, version=after_hash,
+                                        change_kind='updated' if before_hash != after_hash else 'unchanged',
+                                        change_evidence='locked_commit_readback')
+                            except Exception:
+                                pass  # Commit stands; only evidence is unavailable.
+                            b_receipt['commit_evidence'] = proof
 
                     queue_captured = getattr(
                         rt.bucket_mgr, "_queue_captured_derived_state", None
@@ -1140,7 +1178,14 @@ async def _merge_or_create_inner(
                         candidate_id,
                     )
         except Exception as e:
+            b_receipt = _b_write_receipt.get()
+            if b_receipt is not None and (b_receipt.get('commit_attempted') or b_receipt.get('preimage_conflict')):
+                raise  # Never replay an uncertain B update as a new bucket.
             rt.logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
+
+    b_receipt = _b_write_receipt.get()
+    if b_receipt is not None and (b_receipt.get('commit_attempted') or b_receipt.get('preimage_conflict')):
+        raise RuntimeError('B merge evidence uncertain; no create fallback')
 
     async def create_bucket(final_importance: int) -> str:
         return await rt.bucket_mgr.create(

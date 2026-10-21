@@ -87,9 +87,9 @@ async def write(payload):
                                 for r in bucket.get('metadata', {}).get('source_refs', []))):
                     result.update(status='confirmed', provider_id=bucket_id)
                     # The core's existing acknowledgement distinguishes a real
-                    # create from an existing-target write. It does NOT expose
-                    # the locked preimage for merges. Never reconstruct that
-                    # preimage using an unlocked search or shadow event log.
+                    # create from an existing-target write. Merge proof comes
+                    # only from the opt-in locked commit receipt, never an
+                    # unlocked search or shadow event log.
                     result.update(version=sha(bucket['content']), previous_version=None,
                                   change_kind='unobserved_change', before_state='unobserved',
                                   change_evidence='preimage_unavailable')
@@ -102,6 +102,20 @@ async def write(payload):
                             result['change_evidence'] = 'create_readback_drift'
                     elif ack.get('merged') is True:
                         result['write_kind'] = 'updated_existing'
+                        proof = ack.get('commit_evidence', {})
+                        before, committed = proof.get('previous_version'), proof.get('version')
+                        change = proof.get('change_kind')
+                        if (proof.get('provider_id') == bucket_id
+                                and proof.get('change_evidence') == 'locked_commit_readback'
+                                and isinstance(before, str) and re.fullmatch('[0-9a-f]{64}', before)
+                                and isinstance(committed, str) and re.fullmatch('[0-9a-f]{64}', committed)
+                                and change == ('unchanged' if before == committed else 'updated')):
+                            result.update(previous_version=before, committed_version=committed)
+                            if result['version'] == committed:
+                                result.update(change_kind=change, before_state='locked_preimage',
+                                              change_evidence='locked_commit_readback')
+                            else:
+                                result['change_evidence'] = 'post_commit_readback_drift'
         except Exception:
             # Exception may follow a durable write. No retry, no claim of failure.
             pass

@@ -30,7 +30,7 @@ import asyncio
 from utils import normalize_memory_title
 
 from .. import _runtime as rt
-from .._common import merge_or_create, check_duplicate_for, check_plan_resolution
+from .._common import merge_or_create, check_duplicate_for, check_plan_resolution, _b_write_receipt
 
 
 async def store_core(
@@ -98,24 +98,29 @@ async def store_core(
         )
         return f"新建→{bucket_id} {','.join(str(d) for d in final_domain if d is not None)}\n梦境归档：dont_surface=True"
 
-    result_name, is_merged, embed_warn = await merge_or_create(
-        content=content,
-        tags=all_tags,
-        importance=importance,
-        domain=final_domain,
-        valence=final_valence,
-        arousal=final_arousal,
-        name=suggested_name,
-        title=final_title,
-        source_refs=source_refs,
-        quotes=quotes,
-        raw_merge=True,
-        why_remembered=why_remembered,
-        source_tool="hold",
-        meaning=meaning,
-        media=media,
-        test_data=test_data,
-    )
+    receipt_token = _b_write_receipt.set(_b_receipt) if _b_receipt is not None else None
+    try:
+        result_name, is_merged, embed_warn = await merge_or_create(
+            content=content,
+            tags=all_tags,
+            importance=importance,
+            domain=final_domain,
+            valence=final_valence,
+            arousal=final_arousal,
+            name=suggested_name,
+            title=final_title,
+            source_refs=source_refs,
+            quotes=quotes,
+            raw_merge=True,
+            why_remembered=why_remembered,
+            source_tool="hold",
+            meaning=meaning,
+            media=media,
+            test_data=test_data,
+        )
+    finally:
+        if receipt_token is not None:
+            _b_write_receipt.reset(receipt_token)
 
     if _b_receipt is not None:
         # Internal structured acknowledgement, before optional follow-up tasks.

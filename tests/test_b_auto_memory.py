@@ -134,7 +134,8 @@ async def test_real_hold_create_merge_ids_and_retained_b_provenance(runtime):
     assert again['status'] == 'confirmed'
     assert again['results'][0]['provider_id'] == bid
     assert again['results'][0]['write_kind'] == 'updated_existing'
-    assert again['results'][0]['change_kind'] == 'unobserved_change'
+    assert again['results'][0]['change_kind'] == 'unchanged'
+    assert again['results'][0]['previous_version'] == again['results'][0]['version']
     assert len(await buckets.list_all()) == 1
     assert len((await buckets.get(bid))['metadata']['source_refs']) == 2
 
@@ -172,7 +173,7 @@ async def test_unverified_id_or_missing_evidence_is_unknown(runtime, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_real_material_merge_does_not_invent_a_locked_preimage(runtime, monkeypatch):
+async def test_real_material_merge_captures_locked_preimage_and_committed_body(runtime, monkeypatch):
     engine, buckets = runtime
     bid = await buckets.create(content='old material fixture', domain=['生活'])
     before = await buckets.get(bid)
@@ -186,8 +187,9 @@ async def test_real_material_merge_does_not_invent_a_locked_preimage(runtime, mo
     item = result['results'][0]
     assert item['status'] == 'confirmed' and item['provider_id'] == bid
     assert item['write_kind'] == 'updated_existing'
-    assert item['change_kind'] == 'unobserved_change'
-    assert item['previous_version'] is None and item['before_state'] == 'unobserved'
+    assert item['change_kind'] == 'updated'
+    assert item['previous_version'] == b_auto.sha(before['content'])
+    assert item['before_state'] == 'locked_preimage'
     assert item['version'] == b_auto.sha(after['content'])
 
 
@@ -328,10 +330,10 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
         assert bucket_count == {'skip': 0, 'multi': 2}.get(outcome, 1)
         from companion_memory_review import MemoryReview
         review = MemoryReview(fixture.state)
-        expected_pending = {'confirmed': 1, 'multi': 2, 'partial': 1}.get(outcome, 0)
+        expected_pending = {'confirmed': 1, 'multi': 2, 'partial': 1, 'merged_change': 1}.get(outcome, 0)
         assert review.report(now=__import__('time').time())['backlog']['pending'] == expected_pending
-        if outcome in ('merged_noop', 'merged_change'):
-            assert review.report(now=__import__('time').time())['observations']['unobserved_change'] == 1
+        if outcome == 'merged_noop':
+            assert review.report(now=__import__('time').time())['observations']['unchanged'] == 1
         reopened = home_fixture.DisplayState(fixture.state.root)
         try:
             assert await MemoryWork(reopened).run_one(adapter, max_source_chars=8000,
@@ -342,3 +344,127 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
             reopened.db.close()
     finally:
         fixture.doCleanups()
+
+
+async def merge_target(runtime, monkeypatch):
+    engine, buckets = runtime
+    bid = await buckets.create(content='initial fixture body', domain=['生活'])
+    async def search(*args, **kwargs):
+        return [dict(await buckets.get(bid), score=100)]
+    monkeypatch.setattr(buckets, 'search', search)
+    engine.judge_same_event = AsyncMock(return_value=dict(same_event=True, confidence=1))
+    return bid, buckets
+
+
+@pytest.mark.asyncio
+async def test_concurrent_updates_serialize_and_capture_each_actual_commit(runtime, monkeypatch):
+    bid, buckets = await merge_target(runtime, monkeypatch)
+    results = await asyncio.gather(b_auto.write(payload(['first change'])),
+                                   b_auto.write(payload(['second change'])))
+    assert [r['status'] for r in results] == ['confirmed', 'confirmed']
+    first, second = [r['results'][0] for r in results]
+    # The existing merge-target lock serializes different content fan-in.
+    assert first['previous_version'] == b_auto.sha('initial fixture body')
+    assert first['version'] == second['previous_version']
+    assert second['version'] == b_auto.sha((await buckets.get(bid))['content'])
+    assert first['change_kind'] == second['change_kind'] == 'updated'
+    assert len(await buckets.list_all()) == 1
+    # Each task's optional evidence sink was reset, including on conflict.
+    from tools._common import _b_write_receipt
+    assert _b_write_receipt.get() is None
+
+
+@pytest.mark.asyncio
+async def test_sequential_updates_use_actual_latest_preimage(runtime, monkeypatch):
+    bid, buckets = await merge_target(runtime, monkeypatch)
+    first = (await b_auto.write(payload(['first change'])))['results'][0]
+    second = (await b_auto.write(payload(['second change'])))['results'][0]
+    assert first['provider_id'] == second['provider_id'] == bid
+    assert first['version'] == second['previous_version']
+    assert first['previous_version'] != second['version']
+    assert second['change_kind'] == 'updated'
+    assert 'initial fixture body' not in json.dumps(second)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['false', 'before', 'after'])
+async def test_update_failure_cannot_fallback_create_or_replay(runtime, monkeypatch, failure):
+    bid, buckets = await merge_target(runtime, monkeypatch)
+    original = buckets._update_locked
+    calls = []
+    async def update(*args, **kwargs):
+        calls.append(args[0])
+        if failure == 'false':
+            return False
+        if failure == 'after':
+            await original(*args, **kwargs)
+        raise OSError('fixture commit uncertainty')
+    monkeypatch.setattr(buckets, '_update_locked', update)
+    result = await b_auto.write(payload(['new change', 'must not send']))
+    assert result['status'] == 'unknown'
+    assert [r['status'] for r in result['results']] == ['unknown', 'not_sent']
+    assert calls == [bid]
+    assert len(await buckets.list_all()) == 1
+    assert ('new change' in (await buckets.get(bid))['content']) == (failure == 'after')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('readback', ['locked_failure', 'later_drift', 'later_failure'])
+async def test_failed_or_drifted_post_commit_read_is_not_update_proof(runtime, monkeypatch, readback):
+    bid, buckets = await merge_target(runtime, monkeypatch)
+    original_get, original_update = buckets.get, buckets._update_locked
+    reads = None
+    outer_read = False
+    original_store = b_auto.store_core
+    async def store(*args, **kwargs):
+        nonlocal outer_read
+        result = await original_store(*args, **kwargs)
+        outer_read = True
+        return result
+    monkeypatch.setattr(b_auto, "store_core", store)
+    async def update(*args, **kwargs):
+        nonlocal reads
+        committed = await original_update(*args, **kwargs)
+        reads = 0
+        return committed
+    async def get(key):
+        nonlocal reads
+        result = await original_get(key)
+        if reads is not None:
+            reads += 1
+            if (readback == 'locked_failure' and reads == 1
+                    or readback == 'later_failure' and outer_read):
+                raise OSError('fixture read failed')
+            if readback == 'later_drift' and outer_read:
+                result = dict(result, content='different later body')
+        return result
+    monkeypatch.setattr(buckets, '_update_locked', update)
+    monkeypatch.setattr(buckets, 'get', get)
+    result = await b_auto.write(payload(['new change']))
+    item = result['results'][0]
+    if readback == 'later_failure':
+        assert item['status'] == 'unknown'
+    else:
+        assert item['status'] == 'confirmed'
+        assert item['change_kind'] == 'unobserved_change'
+        if readback == 'later_drift':
+            assert item['change_evidence'] == 'post_commit_readback_drift'
+    assert 'new change' in (await original_get(bid))['content']
+    assert len(await buckets.list_all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_external_preimage_conflict_stops_without_retry_or_create(runtime, monkeypatch):
+    bid, buckets = await merge_target(runtime, monkeypatch)
+    calls = 0
+    async def concurrent_edit(*args):
+        nonlocal calls
+        calls += 1
+        await buckets.update(bid, content='independent edit')
+        return dict(same_event=True, confidence=1)
+    rt.dehydrator.judge_same_event = concurrent_edit
+    result = await b_auto.write(payload(['must not overwrite']))
+    assert result['status'] == 'unknown'
+    assert calls == 1
+    assert (await buckets.get(bid))['content'] == 'independent edit'
+    assert len(await buckets.list_all()) == 1
