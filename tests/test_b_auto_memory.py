@@ -114,6 +114,10 @@ async def test_real_hold_create_merge_ids_and_retained_b_provenance(runtime):
     request = payload()
     first = await b_auto.write(request)
     assert first['status'] == 'confirmed'
+    assert first['results'][0]['write_kind'] == 'created_new'
+    assert first['results'][0]['change_kind'] == 'created'
+    assert first['results'][0]['previous_version'] is None
+    assert first['results'][0]['version'] == b_auto.sha(request['decision']['items'][0])
     bid = first['results'][0]['provider_id']
     bucket = await buckets.get(bid)
     assert bucket['content'] == request['decision']['items'][0]
@@ -129,6 +133,8 @@ async def test_real_hold_create_merge_ids_and_retained_b_provenance(runtime):
     again = await b_auto.write(second)
     assert again['status'] == 'confirmed'
     assert again['results'][0]['provider_id'] == bid
+    assert again['results'][0]['write_kind'] == 'updated_existing'
+    assert again['results'][0]['change_kind'] == 'unobserved_change'
     assert len(await buckets.list_all()) == 1
     assert len((await buckets.get(bid))['metadata']['source_refs']) == 2
 
@@ -163,6 +169,42 @@ async def test_unverified_id_or_missing_evidence_is_unknown(runtime, monkeypatch
         kwargs['_b_receipt']['provider_id'] = 'abcdef123456'
     monkeypatch.setattr(b_auto, 'store_core', nonexistent)
     assert (await b_auto.write(payload()))['status'] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_real_material_merge_does_not_invent_a_locked_preimage(runtime, monkeypatch):
+    engine, buckets = runtime
+    bid = await buckets.create(content='old material fixture', domain=['生活'])
+    before = await buckets.get(bid)
+    async def search(*args, **kwargs):
+        return [dict(await buckets.get(bid), score=100)]
+    monkeypatch.setattr(buckets, 'search', search)
+    engine.judge_same_event = AsyncMock(return_value=dict(same_event=True, confidence=1))
+    result = await b_auto.write(payload(['new material fixture']))
+    after = await buckets.get(bid)
+    assert before['content'] != after['content']
+    item = result['results'][0]
+    assert item['status'] == 'confirmed' and item['provider_id'] == bid
+    assert item['write_kind'] == 'updated_existing'
+    assert item['change_kind'] == 'unobserved_change'
+    assert item['previous_version'] is None and item['before_state'] == 'unobserved'
+    assert item['version'] == b_auto.sha(after['content'])
+
+
+@pytest.mark.asyncio
+async def test_create_readback_drift_does_not_fabricate_created_version(runtime, monkeypatch):
+    _, buckets = runtime
+    original = buckets.get
+    async def drift(bucket_id):
+        value = await original(bucket_id)
+        if value:
+            return dict(value, content='concurrent external edit fixture')
+        return value
+    monkeypatch.setattr(buckets, 'get', drift)
+    result = await b_auto.write(payload())
+    assert result['status'] == 'confirmed'
+    assert result['results'][0]['change_kind'] == 'unobserved_change'
+    assert result['results'][0]['change_evidence'] == 'create_readback_drift'
 
 
 @pytest.mark.asyncio
@@ -227,7 +269,7 @@ async def test_existing_hold_public_return_and_dream_archive_unchanged(runtime):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.environ.get('ZER_HOME_TEST_SOURCE'), reason='separate Home checkout optional')
-@pytest.mark.parametrize('outcome', ['confirmed', 'skip', 'multi', 'lost_ack', 'partial'])
+@pytest.mark.parametrize('outcome', ['confirmed', 'skip', 'multi', 'lost_ack', 'partial', 'merged_noop', 'merged_change'])
 async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_path, monkeypatch, outcome):
     home = Path(os.environ['ZER_HOME_TEST_SOURCE'])
     sys.path[:0] = [str(home / 'prototypes/claude_interactive_tmux'),
@@ -242,6 +284,12 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
         items = [] if outcome == 'skip' else ['first fixture event', 'second fixture event'] if outcome in ('multi', 'partial') else ['one fixture event']
         engine._chat.return_value = json.dumps(dict(action='save' if items else 'skip', items=items,
             event_shape=('single' if len(items) == 1 else 'multi') if items else 'none'))
+        if outcome in ('merged_noop', 'merged_change'):
+            bid = await buckets.create(content=items[0] if outcome == 'merged_noop' else 'old fixture event', domain=['生活'])
+            async def search(*args, **kwargs):
+                return [dict(await buckets.get(bid), score=100)]
+            monkeypatch.setattr(buckets, 'search', search)
+            engine.judge_same_event = AsyncMock(return_value=dict(same_event=True, confidence=1))
         if outcome == 'partial':
             original = b_auto.store_core
             count = 0
@@ -278,11 +326,18 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
             assert await rt.bucket_mgr.get(result['receipt']['results'][0]['provider_id'])
         bucket_count = len(await buckets.list_all())
         assert bucket_count == {'skip': 0, 'multi': 2}.get(outcome, 1)
+        from companion_memory_review import MemoryReview
+        review = MemoryReview(fixture.state)
+        expected_pending = {'confirmed': 1, 'multi': 2, 'partial': 1}.get(outcome, 0)
+        assert review.report(now=__import__('time').time())['backlog']['pending'] == expected_pending
+        if outcome in ('merged_noop', 'merged_change'):
+            assert review.report(now=__import__('time').time())['observations']['unobserved_change'] == 1
         reopened = home_fixture.DisplayState(fixture.state.root)
         try:
             assert await MemoryWork(reopened).run_one(adapter, max_source_chars=8000,
                 max_items=3, classification_timeout=2, write_timeout=2) is None
             assert len(await buckets.list_all()) == bucket_count
+            assert MemoryReview(reopened).report(now=__import__('time').time())['backlog']['pending'] == expected_pending
         finally:
             reopened.db.close()
     finally:

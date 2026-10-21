@@ -86,6 +86,22 @@ async def write(payload):
                         and any(r.get('ref') == source_ref
                                 for r in bucket.get('metadata', {}).get('source_refs', []))):
                     result.update(status='confirmed', provider_id=bucket_id)
+                    # The core's existing acknowledgement distinguishes a real
+                    # create from an existing-target write. It does NOT expose
+                    # the locked preimage for merges. Never reconstruct that
+                    # preimage using an unlocked search or shadow event log.
+                    result.update(version=sha(bucket['content']), previous_version=None,
+                                  change_kind='unobserved_change', before_state='unobserved',
+                                  change_evidence='preimage_unavailable')
+                    if ack.get('merged') is False:
+                        result['write_kind'] = 'created_new'
+                        if bucket['content'] == text:
+                            result.update(change_kind='created', before_state='absent_by_create',
+                                          change_evidence='hold_create_exact_readback')
+                        else:
+                            result['change_evidence'] = 'create_readback_drift'
+                    elif ack.get('merged') is True:
+                        result['write_kind'] = 'updated_existing'
         except Exception:
             # Exception may follow a durable write. No retry, no claim of failure.
             pass
