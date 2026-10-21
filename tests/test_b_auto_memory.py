@@ -197,6 +197,25 @@ async def test_http_auth_registration_and_no_mcp_tools(runtime):
 
 
 @pytest.mark.asyncio
+async def test_review_read_interface_has_no_write_or_activation(runtime, monkeypatch):
+    _, buckets = runtime
+    bid = await buckets.create(content='isolated review body', domain=['fixture'])
+    before = (await buckets.get(bid))
+    monkeypatch.setattr(b_auto, 'store_core', AsyncMock(side_effect=AssertionError('no memory writes')))
+    monkeypatch.setattr(rt.source_store, 'put', MagicMock(side_effect=AssertionError('no source writes')))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app()), base_url='http://fixture') as client:
+        assert (await client.post('/b-memory/read', json={'bucket_id': bid})).status_code == 401
+        response = await client.post('/b-memory/read', json={'bucket_id': bid},
+                                     headers={'Authorization': 'Bearer fixture-token'})
+        assert response.status_code == 200
+        assert response.json() == dict(bucket_id=bid, content='isolated review body', version=b_auto.sha('isolated review body'))
+    assert await buckets.get(bid) == before
+    assert await b_auto.read_bucket({'bucket_id': '000000000000'}) is None
+    with pytest.raises(ValueError):
+        await b_auto.read_bucket({'bucket_id': '../invalid'})
+
+
+@pytest.mark.asyncio
 async def test_existing_hold_public_return_and_dream_archive_unchanged(runtime):
     _, buckets = runtime
     reply = await core.store_core('ordinary fixture', [], 5, -1, -1, '')

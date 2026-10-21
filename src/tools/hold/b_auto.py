@@ -101,6 +101,18 @@ async def write(payload):
                 status=status, results=results)
 
 
+async def read_bucket(body):
+    """Current content/version only; get() does not activate or mutate a bucket."""
+    bucket_id = body.get('bucket_id')
+    if not isinstance(bucket_id, str) or re.fullmatch(r'[0-9a-f]{12}', bucket_id) is None:
+        raise ValueError('invalid bucket ID')
+    bucket = await rt.bucket_mgr.get(bucket_id)
+    if bucket is None:
+        return None
+    content = bucket['content']
+    return dict(bucket_id=bucket_id, version=sha(content), content=content)
+
+
 def register(mcp, token_validators):
     # Installed only with this provider code; no credential discovery/new config.
     from starlette.responses import JSONResponse
@@ -130,3 +142,7 @@ def register(mcp, token_validators):
     @mcp.custom_route('/b-memory/write', methods=['POST'])
     async def write_route(request):
         return await handle(request, write)
+
+    @mcp.custom_route('/b-memory/read', methods=['POST'])
+    async def read_route(request):
+        return await handle(request, read_bucket)
