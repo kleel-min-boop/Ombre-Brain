@@ -2,6 +2,9 @@
 import hashlib
 import json
 import re
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import math
 
 from .. import _runtime as rt
 from .._common import check_content_size, max_grow_input_bytes, max_grow_items
@@ -16,7 +19,80 @@ def sha(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
+def source_instant(value):
+    value = datetime.fromisoformat(value)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError('aware B timestamp required')
+    return value.astimezone(timezone.utc)
+
+
+def validate_daily(source):
+    window = source['window']
+    identity = {k: window[k] for k in ('start', 'end', 'timezone', 'settlement_hour')}
+    start, end = source_instant(window['start']), source_instant(window['end'])
+    zone = ZoneInfo(window['timezone'])
+    hour = window['settlement_hour']
+    local = start.astimezone(zone)
+    if (type(hour) is not int or not 0 <= hour < 24
+            or (local.hour, local.minute, local.second, local.microsecond) != (hour, 0, 0, 0)
+            or end != (local + timedelta(days=1)).astimezone(timezone.utc)
+            or source['work_id'] != 'b/memory-day/' + sha(canonical(identity))
+            or window['id'] != source['work_id']):
+        raise ValueError('invalid B daily window')
+    budget = window['budget']
+    if (set(budget) != {'max_source_chars', 'max_items', 'max_output_tokens',
+                        'classification_timeout', 'write_timeout', 'model_attempts', 'write_attempts'}
+            or any(type(budget[k]) is not int or budget[k] < 1
+                   for k in ('max_source_chars', 'max_items', 'max_output_tokens'))
+            or type(budget['model_attempts']) is not int or budget['model_attempts'] != 1
+            or type(budget['write_attempts']) is not int or budget['write_attempts'] != 1
+            or any(type(budget[k]) not in (int, float) or not math.isfinite(budget[k]) or budget[k] <= 0
+                   for k in ('classification_timeout', 'write_timeout'))):
+        raise ValueError('invalid daily B budgets')
+    frozen = {k: source[k] for k in ('origin', 'unit', 'work_id', 'window', 'sources', 'exchange')}
+    if (source.get('source_sha256') != sha(canonical(frozen))
+            or len(canonical(dict(frozen, source_sha256=source['source_sha256']))) > budget['max_source_chars']):
+        raise ValueError('daily source fingerprint/budget mismatch')
+    refs, exchange = source['sources'], source['exchange']
+    if not isinstance(refs, list) or not isinstance(exchange, list) or not refs or len(refs) != len(exchange):
+        raise ValueError('invalid daily source coverage')
+    seen, turns, order = set(), {}, []
+    for ref, item in zip(refs, exchange):
+        provenance = ref['provenance']
+        at = source_instant(ref['created'])
+        if (ref['source_id'] in seen or ref['source_id'] != 'home/message/' + ref['message_id']
+                or provenance['message_id'] != ref['message_id']
+                or not all(isinstance(provenance[k], str) and provenance[k] for k in
+                           ('conversation_id', 'turn_id', 'message_id'))
+                or ref['role'] not in ('user', 'zer') or ref['complete'] is not True or ref['source'] != 'user'
+                or type(ref['source_order']) is not int or ref['source_order'] < 1
+                or type(ref['carryover']) is not bool or ref['carryover'] != (at < start)
+                or at >= end or not isinstance(item.get('content'), str)
+                or sha(item['content']) != ref['source_sha256']
+                or any(item.get(k) != ref[k] for k in ('source_id', 'role', 'created', 'source_order',
+                                                      'complete', 'source', 'carryover', 'provenance'))):
+            raise ValueError('daily B source mismatch')
+        seen.add(ref['source_id'])
+        turns.setdefault((provenance['conversation_id'], provenance['turn_id']), []).append(ref)
+        order.append((at, ref['source_order']))
+    if order != sorted(order):
+        raise ValueError('daily B source out of order')
+    for refs_in_turn in turns.values():
+        if (refs_in_turn[0]['role'] != 'user' or sum(r['role'] == 'user' for r in refs_in_turn) != 1
+                or not any(r['role'] == 'zer' for r in refs_in_turn)):
+            raise ValueError('incomplete daily B turn')
+
+
 def validate_source(source):
+    if isinstance(source, dict) and source.get('unit') == 'daily-v1':
+        if source.get('origin') != 'b_auto_derived':
+            raise ValueError('invalid daily B origin')
+        validate_daily(source)
+        if len(canonical(source).encode('utf-8')) > max_grow_input_bytes():
+            raise ValueError('B input exceeds existing provider limit')
+        return
+    if isinstance(source, dict) and 'unit' in source:
+        raise ValueError('unknown B source unit')
     if (not isinstance(source, dict) or source.get('origin') != 'b_auto_derived'
             or not isinstance(source.get('work_id'), str)
             or not source['work_id'].startswith('b/memory-work/')):
@@ -51,6 +127,10 @@ async def classify(body):
     limit = body['max_items']
     if type(limit) is not int or not 1 <= limit <= max_grow_items():
         raise ValueError('invalid B item limit')
+    if source.get('unit') == 'daily-v1':
+        if limit > source['window']['budget']['max_items']:
+            raise ValueError('daily B item budget exceeded')
+        return await rt.dehydrator.classify_b_auto(source['exchange'], max_items=limit, window=source['window'])
     return await rt.dehydrator.classify_b_auto(source['exchange'], max_items=limit)
 
 
@@ -63,6 +143,8 @@ async def write(payload):
             or decision['action'] != 'save'):
         raise ValueError('invalid B operation')
     items = decision['items']
+    if payload.get('unit') == 'daily-v1' and len(items) > payload['window']['budget']['max_items']:
+        raise ValueError('daily B item budget exceeded')
     if (not isinstance(items, list) or not 1 <= len(items) <= max_grow_items()
             or decision['event_shape'] != ('single' if len(items) == 1 else 'multi')
             or any(not isinstance(i, str) or not i.strip() or check_content_size(i) for i in items)
@@ -127,8 +209,11 @@ async def write(payload):
             break
     status = ('confirmed' if all(r['status'] == 'confirmed' for r in results)
               else 'partial' if any(r['status'] == 'confirmed' for r in results) else 'unknown')
-    return dict(operation_id=payload['operation_id'], decision_sha256=payload['decision_sha256'],
-                status=status, results=results)
+    receipt = dict(operation_id=payload['operation_id'], decision_sha256=payload['decision_sha256'],
+                   status=status, results=results)
+    if payload.get('unit') == 'daily-v1':
+        receipt['source_sha256'] = payload['source_sha256']
+    return receipt
 
 
 async def read_bucket(body):

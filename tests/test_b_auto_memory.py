@@ -286,6 +286,7 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
         items = [] if outcome == 'skip' else ['first fixture event', 'second fixture event'] if outcome in ('multi', 'partial') else ['one fixture event']
         engine._chat.return_value = json.dumps(dict(action='save' if items else 'skip', items=items,
             event_shape=('single' if len(items) == 1 else 'multi') if items else 'none'))
+        engine._chat_once = AsyncMock(return_value=engine._chat.return_value)
         if outcome in ('merged_noop', 'merged_change'):
             bid = await buckets.create(content=items[0] if outcome == 'merged_noop' else 'old fixture event', domain=['生活'])
             async def search(*args, **kwargs):
@@ -302,8 +303,14 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
                     raise TimeoutError('fixture')
                 return await original(*args, **kwargs)
             monkeypatch.setattr(b_auto, 'store_core', partial)
-        rid = fixture.send()
+        rid = fixture.send('早上想买电影票' if outcome == 'multi' else '今天一起看樱花')
         fixture.finish(rid)
+        if outcome == 'multi':
+            for text in ('中午比较两家影院', '下午已经买了电影票', '晚上还收养了一只猫'):
+                more = fixture.send(text)
+                fixture.finish(more)
+        from test_companion_memory_daily import freeze_current_day
+        daily = freeze_current_day(fixture.host.memory_work)
         application = app()
         adapter = OmbreMemoryAdapter('http://fixture', 'fixture-token', timeout=1, max_response_bytes=8000)
         # Real B async adapter and real provider handlers, only HTTP I/O replaced
@@ -319,13 +326,31 @@ async def test_home_adapter_to_actual_provider_routes_and_restart(runtime, tmp_p
                     return response.json()
             return asyncio.run(request())
         monkeypatch.setattr(adapter, '_post', in_process)
-        result = await fixture.host.memory_work.run_one(adapter, max_source_chars=8000,
+        result = await fixture.host.memory_work.run_one(adapter, max_source_chars=50000,
             max_items=3, classification_timeout=2, write_timeout=2)
         expected = {'skip': 'not_sent', 'lost_ack': 'unknown', 'partial': 'partial'}.get(outcome, 'confirmed')
         assert result['classification'] == 'completed' and result['delivery'] == expected
-        assert result['turn_id'] == rid
+        assert result['id'] == daily['id']
+        assert result['sources'][0]['provenance']['turn_id'] == rid
+        if result['receipt']:
+            assert result['receipt']['source_sha256'] == daily['source_sha256']
         if outcome in ('confirmed', 'multi', 'partial'):
             assert await rt.bucket_mgr.get(result['receipt']['results'][0]['provider_id'])
+        if outcome == 'multi':
+            assert daily['source_count'] == 8
+            engine._chat_once.assert_awaited_once()
+            material = json.loads(engine._chat_once.call_args.args[1])
+            assert [i['content'] for i in material['exchange'] if i['role'] == 'user'] == [
+                '早上想买电影票', '中午比较两家影院', '下午已经买了电影票', '晚上还收养了一只猫']
+            for item in result['receipt']['results']:
+                bucket = await buckets.get(item['provider_id'])
+                evidence = json.loads(rt.source_store.read(bucket['metadata']['source_refs'][0]['ref']))
+                assert evidence['sources'] == daily['sources']
+                assert evidence['source_sha256'] == daily['source_sha256']
+                for ref in evidence['sources']:
+                    message = fixture.state.db.execute('SELECT content FROM messages WHERE id=?',
+                                                       (ref['message_id'],)).fetchone()
+                    assert b_auto.sha(message['content']) == ref['source_sha256']
         bucket_count = len(await buckets.list_all())
         assert bucket_count == {'skip': 0, 'multi': 2}.get(outcome, 1)
         from companion_memory_review import MemoryReview
